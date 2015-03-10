@@ -38,7 +38,8 @@
 #include <RFu_JeeLib.h>                                                 
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <DHT.h>
+#include <RFM69.h>
+#include <SPI.h>
 ISR(WDT_vect) { 
   Sleepy::watchdogEvent(); 
 } // Attached JeeLib sleep function to Atmega328 watchdog - enables MCU to be put into sleep mode between readings to reduce power consumption 
@@ -47,26 +48,23 @@ ISR(WDT_vect) {
 /*
  Network configuration
  =====================
- 
-  - RFM12B frequency can be RF12_433MHZ, RF12_868MHZ or RF12_915MHZ. You should use the one matching the module you have.
-  - RFM12B wireless network group - needs to be same as emonBase and emonGLCD
-  - RFM12B node ID - should be unique on network
- 
- Recommended node ID allocation
- ------------------------------------------------------------------------------------------------------------
- -ID-	-Node Type- 
- 0	- Special allocation in JeeLib RFM12 driver - reserved for OOK use
- 1-4    - Control nodes 
- 5-10	- Energy monitoring nodes
- 11-14	--Un-assigned --
- 15-16	- Base Station & logging nodes
- 17-30	- Environmental sensing nodes (temperature humidity etc.)
- 31	- Special allocation in JeeLib RFM12 driver - Node31 can communicate with nodes on any network group
- -------------------------------------------------------------------------------------------------------------
- */
-#define FREQUENCY RF12_433MHZ 
-const int NETWORK_GROUP = 210;
-const int NODE_ID       = 19;
+*/
+#define GATEWAY_ID    1
+#define NODE_ID       21    // node ID
+#define NETWORKID     100    //the same on all nodes that talk to each other
+#define MSG_INTERVAL  30000  // 30000=30s
+
+// Uncomment only one of the following three to match radio frequency
+//#define FREQUENCY     RF69_433MHZ    
+#define FREQUENCY     RF69_868MHZ
+//efine FREQUENCY     RF69_915MHZ
+
+#define IS_RFM69HW   //NOTE: uncomment this ONLY for RFM69HW or RFM69HCW
+#define ENCRYPT_KEY    "0123456789012345"  // use same 16byte encryption key for all devices on net
+#define ACK_TIME       50                  // max msec for ACK wait
+#define LED            9                   // Anardino miniWireless has LEDs on D9
+#define SERIAL_BAUD    115200
+#define TNODE_VERSION  "1.0"
 
 /*
  Monitoring configuration
@@ -83,33 +81,41 @@ const int TEMPERATURE_PRECISION = 11;
 const int ASYNC_DELAY           = 375;
 
 // emonTH pin allocations 
-const int BATT_ADC     = 1;
+const int BATT_ADC     = 1; // will use vcc instead
 const int DS18B20_PWR  = 5;
-const int DHT_PWR      = 6;
 const int LED          = 9;
-const int DHT_PIN      = 18; 
-const int ONE_WIRE_BUS = 19;  
-
-// On board DHT22
-DHT dht(DHT_PIN, DHT22);
-boolean DHT_PRESENT;                                                  
+const int ONE_WIRE_BUS = 4;  
 
 // OneWire for DS18B20
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-// RFM12B RF payload datastructure
-typedef struct {       
-  int battery;    
-  int humidity;                                                  
-  int internalTemp;       	                                      
-  int externalTemp1;       	                                      
-  int externalTemp2;
-  // If you have more sensors, add further variables here.
-} 
-Payload;
+/* THIS MIGHT NOT NEEDED HERE
+union itag {
+  uint8_t b[2];
+  uint16_t i;
+}it;
+union ltag {
+  byte b[4];
+  long l;
+}lt; // used to force byte order in case we end up using result in various endian targets...
+*/
+
+// RFM69 RF payload datastructure
+typedef struct {
+  uint8_t          nodeId;
+  unsigned long    uptime;               //4 byte
+  int8_t           tempC;                //1 bytes from RFM69
+  int16_t          vcc;                  //2 bytes in miliVolts
+  int16_t          extTempC1;          //2 bytes in centigrades
+  int16_t          extTempC2;          //2 bytes in centigrades
+} Payload;
 
 Payload rfPayload;
+
+RFM69 radio;                  // global radio instance
+bool promiscuousMode = false; // set 'true' to sniff all packets on the same network
+bool requestACK=false;
 
 boolean debug;
 
@@ -146,14 +152,17 @@ void setup() {
   // LED on
   digitalWrite(LED, HIGH);
 
-  // Initialize RFM12B
-  rf12_initialize(NODE_ID, FREQUENCY, NETWORK_GROUP);                       
-  rf12_sleep(RF12_SLEEP);
-
+  // Initalize RFM69
+  radio.initialize(FREQUENCY, NODE_ID, NETWORKID);
+  radio.encrypt(0);
+  radio.promiscuous(promiscuousMode);
+#ifdef IS_RFM69HW
+  radio.setHighPower(); //uncomment #define ONLY if radio is of type: RFM69HW or RFM69HCW 
+#endif
+  
   reduce_power();
   
   // Initialise sensors
-  initialise_DHT22();
   initialise_DS18B20();
 
   // Confirm we've got at least one sensor, or shut down.
@@ -173,21 +182,15 @@ void loop()
   if (EXT_SENSOR1_PRESENT || EXT_SENSOR2_PRESENT) 
     take_ds18b20_reading();
 
-  // Internal temperature / humidity readings
-  if (DHT_PRESENT)
-    take_dht22_reading();
-
   // Battery reading
   take_battery_reading();
 
   // Debugging
   print_payload();                                             
 
-  power_spi_enable();  
-  rf12_sleep(RF12_WAKEUP);
-  rf12_sendNow(0, &rfPayload, sizeof rfPayload);
-  rf12_sendWait(2);
-  rf12_sleep(RF12_SLEEP);
+  power_spi_enable();    
+  radio.sendWithRetry((byte)GATEWAY_ID, (const void *)(&myPayload),sizeof(myPayload), 2);
+  radio.sleep(); // ??
   power_spi_disable();  
 
   if (debug){
@@ -225,46 +228,8 @@ void reduce_power()
 void set_pin_modes()
 {
   pinMode(LED,         OUTPUT); 
-  pinMode(DHT_PWR,   OUTPUT);
-  pinMode(DS18B20_PWR, OUTPUT);
   pinMode(BATT_ADC,    INPUT);
 }
-
-/**
- * Find the DHT22 sensor, if fitted
- */
-void initialise_DHT22()
-{
-  DHT_PRESENT=1;
-
-  // Switch on and wait for warm up
-  digitalWrite(DHT_PWR,HIGH);
-  dodelay(2000);                   
-  dht.begin();
-
-  // We should get numeric readings, or something's up.
-  if (isnan(dht.readTemperature()) || isnan(dht.readHumidity()))                                         
-  {
-    if (debug) Serial.println("Unable to find DHT22 temp & humidity sensor... trying again"); 
-    Sleepy::loseSomeTime(1500); 
-
-    // One last try
-    if (isnan(dht.readTemperature()) || isnan(dht.readHumidity()))   
-    {
-      if (debug) Serial.println("Unable to find DHT22 temp & humidity sensor... giving up"); 
-      DHT_PRESENT=0;
-    } 
-  } 
-
-  if (debug && DHT_PRESENT) {
-    
-    Serial.println("Detected DHT22 temp & humidity sensor");  
-  }
-
-  // Power off for now
-  digitalWrite(DHT_PWR,LOW);                                          
-}
-
 
 /**
  * Find the expected DS18B20 sensors
@@ -321,7 +286,7 @@ void initialise_DS18B20()
  */
 void validate_sensor_presence()
 {
-  if (!DHT_PRESENT && !EXT_SENSOR1_PRESENT && !EXT_SENSOR2_PRESENT) 
+  if (!EXT_SENSOR1_PRESENT && !EXT_SENSOR2_PRESENT) 
   {
     if (debug) {
       
@@ -345,25 +310,23 @@ void validate_sensor_presence()
 void take_battery_reading()
 {
   // convert ADC to volts x10
-  rfPayload.battery=int(analogRead(BATT_ADC)*0.03225806);                    
+  //rfPayload.battery=int(analogRead(BATT_ADC)*0.03225806);                 
+  // in millivolts
+  rfPayload.battery=readVcc();
 }
 
-/**
- * Convenience method; DHT22 readings
- */
-void take_dht22_reading()
-{
-  // Power on. It's a long wait for this sensor!
-  digitalWrite(DHT_PWR, HIGH);                
-  dodelay(2000);                                
-
-  rfPayload.humidity = ( (dht.readHumidity() )* 10 );
-
-  float temp=(dht.readTemperature());
-  if (temperature_in_range(temp)) 
-    rfPayload.internalTemp = (temp*10);
-
-  digitalWrite(DHT_PWR, LOW); 
+int readVcc() {   // return vcc voltage in millivolts
+  long result;
+  // Read 1.1V reference against AVcc
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2);             // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC);  // Convert
+  while (bit_is_set(ADCSRA,ADSC));
+  result = ADCL;
+  result |= ADCH<<8;
+  result = 1126400L / result; // Back-calculate in mV
+  int t = (int)result;
+  return t;
 }
 
 
@@ -406,9 +369,10 @@ void sleep_until_next_reading(){
   byte oldADCSRB=ADCSRB;
   byte oldADMUX=ADMUX;
   
-  for (int i=0; i<MINS_BETWEEN_READINGS; i++) {
-      Sleepy::loseSomeTime(55000);  
-  }
+  //for (int i=0; i<MINS_BETWEEN_READINGS; i++) {
+  //    Sleepy::loseSomeTime(55000);  
+  //}
+  Sleepy::loseSomeTime(30000);
   
   ADCSRA=oldADCSRA; // restore ADC state
   ADCSRB=oldADCSRB;
@@ -427,7 +391,7 @@ void print_payload()
   Serial.println("emonTH payload: ");
 
   Serial.print("  Battery voltage: ");
-  Serial.print(rfPayload.battery/10.0);
+  Serial.print(rfPayload.battery/1000.0);
   Serial.println("V");
   
   Serial.print("  External sensor 1: ");
@@ -450,17 +414,6 @@ void print_payload()
     Serial.println(" not present");
   }
   
-  if (DHT_PRESENT){
-    Serial.print("  Internal DHT22 temperature: ");
-    Serial.print(rfPayload.internalTemp/10.0); 
-    Serial.print("C, Humidity: ");
-  
-    Serial.print(rfPayload.humidity/10.0);
-    Serial.println("% ");
-  }
-  else {
-    Serial.println("Internal DHT22 sensor: not present");
-  }
   
   Serial.println();
 }
@@ -474,7 +427,7 @@ void print_welcome_message()
   if (!debug)
     return;
 
-  Serial.begin(9600);
+  Serial.begin(SERIAL_BAUD);
 
   Serial.println("emonTH : OpenEnergyMonitor.org");
   
